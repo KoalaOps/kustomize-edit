@@ -1,0 +1,220 @@
+name: 'Kustomize Edit'
+description: 'Edit kustomize overlays - set images, labels, annotations, and apply patches'
+author: 'KoalaOps'
+
+branding:
+  icon: 'edit'
+  color: 'purple'
+
+inputs:
+  overlay_dir:
+    description: 'Path to kustomize overlay directory'
+    required: true
+  image:
+    description: 'Image name (without tag)'
+    required: false
+  tag:
+    description: 'Image tag'
+    required: false
+  version_label:
+    description: 'Value for app.kubernetes.io/version label'
+    required: false
+  annotations:
+    description: 'Annotations to add (key=value format, one per line)'
+    required: false
+  labels:
+    description: 'Labels to add (key=value format, one per line)'
+    required: false
+  name_prefix:
+    description: 'Name prefix to set'
+    required: false
+  name_suffix:
+    description: 'Name suffix to set'
+    required: false
+  namespace:
+    description: 'Namespace to set'
+    required: false
+  replicas:
+    description: 'Replicas count to set (JSON format, e.g., [{"name":"deployment-name","count":3}])'
+    required: false
+  json_patches:
+    description: 'JSON6902 patches to apply (JSON array)'
+    required: false
+
+outputs:
+  overlay_dir:
+    description: 'Path to the edited overlay'
+    value: ${{ inputs.overlay_dir }}
+  kustomization_file:
+    description: 'Path to kustomization.yaml'
+    value: ${{ inputs.overlay_dir }}/kustomization.yaml
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate overlay directory
+      shell: bash
+      run: |
+        if [ ! -d "${{ inputs.overlay_dir }}" ]; then
+          echo "::error::Overlay directory not found: ${{ inputs.overlay_dir }}"
+          exit 1
+        fi
+        
+        if [ ! -f "${{ inputs.overlay_dir }}/kustomization.yaml" ] && [ ! -f "${{ inputs.overlay_dir }}/kustomization.yml" ]; then
+          echo "::error::No kustomization.yaml found in ${{ inputs.overlay_dir }}"
+          exit 1
+        fi
+        
+        echo "✅ Found kustomization in: ${{ inputs.overlay_dir }}"
+    
+    - name: Set image and tag
+      if: inputs.image != '' && inputs.tag != ''
+      shell: bash
+      working-directory: ${{ inputs.overlay_dir }}
+      run: |
+        echo "🏷️ Setting image: ${{ inputs.image }}:${{ inputs.tag }}"
+        kustomize edit set image "${{ inputs.image }}:${{ inputs.tag }}"
+    
+    - name: Set version label
+      if: inputs.version_label != ''
+      shell: bash
+      working-directory: ${{ inputs.overlay_dir }}
+      run: |
+        echo "🏷️ Setting version label: ${{ inputs.version_label }}"
+        
+        # Update or add the version label
+        if grep -q "app.kubernetes.io/version:" kustomization.yaml; then
+          sed -i.bak "s/app.kubernetes.io\/version:.*/app.kubernetes.io\/version: ${{ inputs.version_label }}/g" kustomization.yaml
+          rm kustomization.yaml.bak
+        else
+          kustomize edit add label "app.kubernetes.io/version:${{ inputs.version_label }}"
+        fi
+    
+    - name: Add annotations
+      if: inputs.annotations != ''
+      shell: bash
+      working-directory: ${{ inputs.overlay_dir }}
+      run: |
+        echo "📝 Adding annotations..."
+        echo "${{ inputs.annotations }}" | while IFS= read -r annotation; do
+          if [ -n "$annotation" ]; then
+            echo "  - $annotation"
+            kustomize edit add annotation "$annotation"
+          fi
+        done
+    
+    - name: Add labels
+      if: inputs.labels != ''
+      shell: bash
+      working-directory: ${{ inputs.overlay_dir }}
+      run: |
+        echo "🏷️ Adding labels..."
+        echo "${{ inputs.labels }}" | while IFS= read -r label; do
+          if [ -n "$label" ]; then
+            echo "  - $label"
+            kustomize edit add label "$label"
+          fi
+        done
+    
+    - name: Set name prefix
+      if: inputs.name_prefix != ''
+      shell: bash
+      working-directory: ${{ inputs.overlay_dir }}
+      run: |
+        echo "📛 Setting name prefix: ${{ inputs.name_prefix }}"
+        kustomize edit set nameprefix "${{ inputs.name_prefix }}"
+    
+    - name: Set name suffix
+      if: inputs.name_suffix != ''
+      shell: bash
+      working-directory: ${{ inputs.overlay_dir }}
+      run: |
+        echo "📛 Setting name suffix: ${{ inputs.name_suffix }}"
+        kustomize edit set namesuffix "${{ inputs.name_suffix }}"
+    
+    - name: Set namespace
+      if: inputs.namespace != ''
+      shell: bash
+      working-directory: ${{ inputs.overlay_dir }}
+      run: |
+        echo "📁 Setting namespace: ${{ inputs.namespace }}"
+        kustomize edit set namespace "${{ inputs.namespace }}"
+    
+    - name: Set replicas
+      if: inputs.replicas != ''
+      shell: bash
+      working-directory: ${{ inputs.overlay_dir }}
+      run: |
+        echo "🔢 Setting replicas..."
+        REPLICAS='${{ inputs.replicas }}'
+        
+        # Validate JSON
+        if ! echo "$REPLICAS" | jq empty 2>/dev/null; then
+          echo "::error::Invalid replicas JSON format"
+          exit 1
+        fi
+        
+        # Process each replica setting
+        echo "$REPLICAS" | jq -c '.[]' | while read -r replica; do
+          NAME=$(echo "$replica" | jq -r '.name')
+          COUNT=$(echo "$replica" | jq -r '.count')
+          echo "  - $NAME: $COUNT replicas"
+          kustomize edit set replicas "${NAME}=${COUNT}"
+        done
+    
+    - name: Apply JSON patches
+      if: inputs.json_patches != ''
+      shell: bash
+      working-directory: ${{ inputs.overlay_dir }}
+      run: |
+        echo "🔧 Applying JSON patches..."
+        PATCHES='${{ inputs.json_patches }}'
+        
+        # Validate JSON
+        if ! echo "$PATCHES" | jq empty 2>/dev/null; then
+          echo "::error::Invalid json_patches format"
+          exit 1
+        fi
+        
+        # Create patches directory
+        mkdir -p patches
+        
+        # Process each patch
+        PATCH_COUNT=0
+        echo "$PATCHES" | jq -c '.[]' | while read -r patch; do
+          PATCH_COUNT=$((PATCH_COUNT + 1))
+          PATCH_FILE="patches/patch-${PATCH_COUNT}.json"
+          
+          echo "$patch" > "$PATCH_FILE"
+          echo "  - Created $PATCH_FILE"
+          
+          # Add patch to kustomization
+          TARGET=$(echo "$patch" | jq -r '.target // empty')
+          if [ -n "$TARGET" ]; then
+            # Add as a targeted patch
+            cat >> kustomization.yaml <<EOF
+patches:
+- path: $PATCH_FILE
+  target:
+    $(echo "$TARGET" | sed 's/^/    /')
+EOF
+          else
+            # Add as a general patch
+            echo "- $PATCH_FILE" >> kustomization.yaml
+          fi
+        done
+    
+    - name: Validate kustomization
+      shell: bash
+      working-directory: ${{ inputs.overlay_dir }}
+      run: |
+        echo "✅ Validating kustomization..."
+        if ! kustomize build . > /dev/null 2>&1; then
+          echo "::error::Kustomization validation failed"
+          kustomize build . 2>&1 | head -20
+          exit 1
+        fi
+        echo "✅ Kustomization is valid"
+        
+        echo "📋 Final kustomization.yaml:"
+        cat kustomization.yaml
