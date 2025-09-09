@@ -55,46 +55,45 @@ runs:
     - name: Validate overlay directory
       shell: bash
       run: |
+        set -euo pipefail
         if [ ! -d "${{ inputs.overlay_dir }}" ]; then
           echo "::error::Overlay directory not found: ${{ inputs.overlay_dir }}"
           exit 1
         fi
         
-        if [ ! -f "${{ inputs.overlay_dir }}/kustomization.yaml" ] && [ ! -f "${{ inputs.overlay_dir }}/kustomization.yml" ]; then
+        if [ ! -f "${{ inputs.overlay_dir }}/kustomization.yaml" ]; then
           echo "::error::No kustomization.yaml found in ${{ inputs.overlay_dir }}"
           exit 1
         fi
         
-        echo "✅ Found kustomization in: ${{ inputs.overlay_dir }}"
+        echo "✅ Found kustomization.yaml in: ${{ inputs.overlay_dir }}"
     
     - name: Set image and tag
       if: inputs.image != '' && inputs.tag != ''
       shell: bash
       working-directory: ${{ inputs.overlay_dir }}
       run: |
+        set -euo pipefail
         echo "🏷️ Setting image: ${{ inputs.image }}:${{ inputs.tag }}"
-        kustomize edit set image "${{ inputs.image }}:${{ inputs.tag }}"
+        # Try to set image - kustomize will handle both new and existing images
+        kustomize edit set image "${{ inputs.image }}=${{ inputs.image }}:${{ inputs.tag }}"
     
     - name: Set version label
       if: inputs.version_label != ''
       shell: bash
       working-directory: ${{ inputs.overlay_dir }}
       run: |
+        set -euo pipefail
         echo "🏷️ Setting version label: ${{ inputs.version_label }}"
-        
-        # Update or add the version label
-        if grep -q "app.kubernetes.io/version:" kustomization.yaml; then
-          sed -i.bak "s/app.kubernetes.io\/version:.*/app.kubernetes.io\/version: ${{ inputs.version_label }}/g" kustomization.yaml
-          rm kustomization.yaml.bak
-        else
-          kustomize edit add label "app.kubernetes.io/version:${{ inputs.version_label }}"
-        fi
+        # kustomize edit add label will update if exists or add if not
+        kustomize edit add label "app.kubernetes.io/version:${{ inputs.version_label }}"
     
     - name: Add annotations
       if: inputs.annotations != ''
       shell: bash
       working-directory: ${{ inputs.overlay_dir }}
       run: |
+        set -euo pipefail
         echo "📝 Adding annotations..."
         echo "${{ inputs.annotations }}" | while IFS= read -r annotation; do
           if [ -n "$annotation" ]; then
@@ -108,6 +107,7 @@ runs:
       shell: bash
       working-directory: ${{ inputs.overlay_dir }}
       run: |
+        set -euo pipefail
         echo "🏷️ Adding labels..."
         echo "${{ inputs.labels }}" | while IFS= read -r label; do
           if [ -n "$label" ]; then
@@ -121,6 +121,7 @@ runs:
       shell: bash
       working-directory: ${{ inputs.overlay_dir }}
       run: |
+        set -euo pipefail
         echo "📛 Setting name prefix: ${{ inputs.name_prefix }}"
         kustomize edit set nameprefix "${{ inputs.name_prefix }}"
     
@@ -129,6 +130,7 @@ runs:
       shell: bash
       working-directory: ${{ inputs.overlay_dir }}
       run: |
+        set -euo pipefail
         echo "📛 Setting name suffix: ${{ inputs.name_suffix }}"
         kustomize edit set namesuffix "${{ inputs.name_suffix }}"
     
@@ -137,6 +139,7 @@ runs:
       shell: bash
       working-directory: ${{ inputs.overlay_dir }}
       run: |
+        set -euo pipefail
         echo "📁 Setting namespace: ${{ inputs.namespace }}"
         kustomize edit set namespace "${{ inputs.namespace }}"
     
@@ -145,6 +148,7 @@ runs:
       shell: bash
       working-directory: ${{ inputs.overlay_dir }}
       run: |
+        set -euo pipefail
         echo "🔢 Setting replicas..."
         REPLICAS='${{ inputs.replicas }}'
         
@@ -156,8 +160,12 @@ runs:
         
         # Process each replica setting
         echo "$REPLICAS" | jq -c '.[]' | while read -r replica; do
-          NAME=$(echo "$replica" | jq -r '.name')
-          COUNT=$(echo "$replica" | jq -r '.count')
+          NAME=$(echo "$replica" | jq -r '.name // empty')
+          COUNT=$(echo "$replica" | jq -r '.count // empty')
+          if [ -z "$NAME" ] || [ -z "$COUNT" ]; then
+            echo "::error::replicas entries must have {\"name\",\"count\"}"
+            exit 1
+          fi
           echo "  - $NAME: $COUNT replicas"
           kustomize edit set replicas "${NAME}=${COUNT}"
         done
@@ -167,11 +175,12 @@ runs:
       shell: bash
       working-directory: ${{ inputs.overlay_dir }}
       run: |
+        set -euo pipefail
         echo "🔧 Applying JSON patches..."
         PATCHES='${{ inputs.json_patches }}'
         
         # Validate JSON
-        if ! echo "$PATCHES" | jq empty 2>/dev/null; then
+        if ! echo "$PATCHES" | jq -e . >/dev/null 2>&1; then
           echo "::error::Invalid json_patches format"
           exit 1
         fi
@@ -179,35 +188,56 @@ runs:
         # Create patches directory
         mkdir -p patches
         
-        # Process each patch
-        PATCH_COUNT=0
+        # Build the patches section
+        PATCHES_FILE=$(mktemp)
+        HAS_PATCHES=false
+        
+        # Process each patch and create patch files
+        i=0
         echo "$PATCHES" | jq -c '.[]' | while read -r patch; do
-          PATCH_COUNT=$((PATCH_COUNT + 1))
-          PATCH_FILE="patches/patch-${PATCH_COUNT}.json"
+          i=$((i+1))
+          PATCH_FILE="patches/patch-${i}.json"
           
           echo "$patch" > "$PATCH_FILE"
           echo "  - Created $PATCH_FILE"
           
-          # Add patch to kustomization
+          # Build the patch entry
           TARGET=$(echo "$patch" | jq -r '.target // empty')
           if [ -n "$TARGET" ]; then
-            # Add as a targeted patch
-            cat >> kustomization.yaml <<EOF
-patches:
-- path: $PATCH_FILE
-  target:
-    $(echo "$TARGET" | sed 's/^/    /')
-EOF
+            # Format with target
+            {
+              echo "- path: $PATCH_FILE"
+              echo "  target:"
+              echo "$TARGET" | jq -r 'to_entries[] | "    \(.key): \(.value)"'
+            } >> "$PATCHES_FILE"
           else
-            # Add as a general patch
-            echo "- $PATCH_FILE" >> kustomization.yaml
+            # Simple patch reference
+            echo "- path: $PATCH_FILE" >> "$PATCHES_FILE"
           fi
+          HAS_PATCHES=true
         done
+        
+        # Add patches to kustomization.yaml if we have any
+        if [ -s "$PATCHES_FILE" ]; then
+          # Check if patches section already exists
+          if grep -q '^patches:' kustomization.yaml; then
+            # Append to existing patches section
+            sed -i '/^patches:/r '"$PATCHES_FILE" kustomization.yaml
+          else
+            # Add new patches section
+            echo "" >> kustomization.yaml
+            echo "patches:" >> kustomization.yaml
+            cat "$PATCHES_FILE" >> kustomization.yaml
+          fi
+        fi
+        
+        rm -f "$PATCHES_FILE"
     
     - name: Validate kustomization
       shell: bash
       working-directory: ${{ inputs.overlay_dir }}
       run: |
+        set -euo pipefail
         echo "✅ Validating kustomization..."
         if ! kustomize build . > /dev/null 2>&1; then
           echo "::error::Kustomization validation failed"
