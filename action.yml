@@ -1,5 +1,5 @@
 name: 'Kustomize Edit'
-description: 'Edit kustomize overlays - set images, labels, annotations, and apply patches'
+description: 'Edit kustomize overlays - set images, labels, annotations, name/namespace, replicas'
 author: 'KoalaOps'
 
 branding:
@@ -10,6 +10,10 @@ inputs:
   overlay_dir:
     description: 'Path to kustomize overlay directory'
     required: true
+  debug:
+    description: 'Enable debug output'
+    required: false
+    default: 'false'
   image:
     description: 'Image name (without tag)'
     required: false
@@ -20,10 +24,10 @@ inputs:
     description: 'Value for app.kubernetes.io/version label'
     required: false
   annotations:
-    description: 'Annotations to add (key=value format, one per line)'
+    description: 'Annotations to add (key:value or key=value format, one per line)'
     required: false
   labels:
-    description: 'Labels to add (key=value format, one per line)'
+    description: 'Labels to add (key:value or key=value format, one per line)'
     required: false
   name_prefix:
     description: 'Name prefix to set'
@@ -37,9 +41,6 @@ inputs:
   replicas:
     description: 'Replicas count to set (JSON format, e.g., [{"name":"deployment-name","count":3}])'
     required: false
-  json_patches:
-    description: 'JSON6902 patches to apply (JSON array)'
-    required: false
 
 outputs:
   overlay_dir:
@@ -52,6 +53,26 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    - name: Check required tools
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "🔍 Checking required tools..."
+        
+        # Check for kustomize
+        if ! command -v kustomize >/dev/null 2>&1; then
+          echo "::error::kustomize not found. Please install it first. See: https://kubectl.docs.kubernetes.io/installation/kustomize/"
+          exit 1
+        fi
+        
+        # Check for jq (only needed for replicas)
+        if [ -n "${{ inputs.replicas }}" ] && ! command -v jq >/dev/null 2>&1; then
+          echo "::error::jq not found. Required for replicas input. Install with: apt-get install -y jq"
+          exit 1
+        fi
+        
+        echo "✅ Required tools available"
+    
     - name: Validate overlay directory
       shell: bash
       run: |
@@ -95,11 +116,16 @@ runs:
       run: |
         set -euo pipefail
         echo "📝 Adding annotations..."
-        echo "${{ inputs.annotations }}" | while IFS= read -r annotation; do
-          if [ -n "$annotation" ]; then
-            echo "  - $annotation"
-            kustomize edit add annotation "$annotation"
-          fi
+        echo "${{ inputs.annotations }}" | while IFS= read -r line; do
+          # Strip trailing comments and trim whitespace
+          line="${line%%#*}"
+          line="$(echo "$line" | xargs)"
+          [ -z "$line" ] && continue
+          
+          # Convert all = to : for kustomize format (support both formats)
+          line="${line//=/:}"
+          echo "  - $line"
+          kustomize edit add annotation "$line"
         done
     
     - name: Add labels
@@ -109,11 +135,16 @@ runs:
       run: |
         set -euo pipefail
         echo "🏷️ Adding labels..."
-        echo "${{ inputs.labels }}" | while IFS= read -r label; do
-          if [ -n "$label" ]; then
-            echo "  - $label"
-            kustomize edit add label "$label"
-          fi
+        echo "${{ inputs.labels }}" | while IFS= read -r line; do
+          # Strip trailing comments and trim whitespace
+          line="${line%%#*}"
+          line="$(echo "$line" | xargs)"
+          [ -z "$line" ] && continue
+          
+          # Convert all = to : for kustomize format (support both formats)
+          line="${line//=/:}"
+          echo "  - $line"
+          kustomize edit add label "$line"
         done
     
     - name: Set name prefix
@@ -170,69 +201,6 @@ runs:
           kustomize edit set replicas "${NAME}=${COUNT}"
         done
     
-    - name: Apply JSON patches
-      if: inputs.json_patches != ''
-      shell: bash
-      working-directory: ${{ inputs.overlay_dir }}
-      run: |
-        set -euo pipefail
-        echo "🔧 Applying JSON patches..."
-        PATCHES='${{ inputs.json_patches }}'
-        
-        # Validate JSON
-        if ! echo "$PATCHES" | jq -e . >/dev/null 2>&1; then
-          echo "::error::Invalid json_patches format"
-          exit 1
-        fi
-        
-        # Create patches directory
-        mkdir -p patches
-        
-        # Build the patches section
-        PATCHES_FILE=$(mktemp)
-        HAS_PATCHES=false
-        
-        # Process each patch and create patch files
-        i=0
-        echo "$PATCHES" | jq -c '.[]' | while read -r patch; do
-          i=$((i+1))
-          PATCH_FILE="patches/patch-${i}.json"
-          
-          echo "$patch" > "$PATCH_FILE"
-          echo "  - Created $PATCH_FILE"
-          
-          # Build the patch entry
-          TARGET=$(echo "$patch" | jq -r '.target // empty')
-          if [ -n "$TARGET" ]; then
-            # Format with target
-            {
-              echo "- path: $PATCH_FILE"
-              echo "  target:"
-              echo "$TARGET" | jq -r 'to_entries[] | "    \(.key): \(.value)"'
-            } >> "$PATCHES_FILE"
-          else
-            # Simple patch reference
-            echo "- path: $PATCH_FILE" >> "$PATCHES_FILE"
-          fi
-          HAS_PATCHES=true
-        done
-        
-        # Add patches to kustomization.yaml if we have any
-        if [ -s "$PATCHES_FILE" ]; then
-          # Check if patches section already exists
-          if grep -q '^patches:' kustomization.yaml; then
-            # Append to existing patches section
-            sed -i '/^patches:/r '"$PATCHES_FILE" kustomization.yaml
-          else
-            # Add new patches section
-            echo "" >> kustomization.yaml
-            echo "patches:" >> kustomization.yaml
-            cat "$PATCHES_FILE" >> kustomization.yaml
-          fi
-        fi
-        
-        rm -f "$PATCHES_FILE"
-    
     - name: Validate kustomization
       shell: bash
       working-directory: ${{ inputs.overlay_dir }}
@@ -245,6 +213,12 @@ runs:
           exit 1
         fi
         echo "✅ Kustomization is valid"
-        
+    
+    - name: Show debug output
+      if: inputs.debug == 'true'
+      shell: bash
+      working-directory: ${{ inputs.overlay_dir }}
+      run: |
+        set -euo pipefail
         echo "📋 Final kustomization.yaml:"
         cat kustomization.yaml
