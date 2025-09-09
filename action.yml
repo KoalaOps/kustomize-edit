@@ -1,5 +1,5 @@
 name: 'Kustomize Edit'
-description: 'Edit kustomize overlays - set images, labels, annotations, name/namespace, replicas'
+description: 'Edit kustomize overlays - set images, labels, annotations, name/namespace, replicas, ConfigMap values'
 author: 'KoalaOps'
 
 branding:
@@ -41,6 +41,9 @@ inputs:
   replicas:
     description: 'Replicas count to set (JSON format, e.g., [{"name":"deployment-name","count":3}])'
     required: false
+  configmap_values:
+    description: 'ConfigMap values to inject (JSON format, e.g., [{"key":"SENTRY_RELEASE","value":"v1.2.3"}])'
+    required: false
 
 outputs:
   overlay_dir:
@@ -65,9 +68,9 @@ runs:
           exit 1
         fi
         
-        # Check for jq (only needed for replicas)
-        if [ -n "${{ inputs.replicas }}" ] && ! command -v jq >/dev/null 2>&1; then
-          echo "::error::jq not found. Required for replicas input. Install with: apt-get install -y jq"
+        # Check for jq (needed for replicas and configmap_values)
+        if ([ -n "${{ inputs.replicas }}" ] || [ -n "${{ inputs.configmap_values }}" ]) && ! command -v jq >/dev/null 2>&1; then
+          echo "::error::jq not found. Required for replicas or configmap_values input. Install with: apt-get install -y jq"
           exit 1
         fi
         
@@ -199,6 +202,55 @@ runs:
           fi
           echo "  - $NAME: $COUNT replicas"
           kustomize edit set replicas "${NAME}=${COUNT}"
+        done
+    
+    - name: Inject ConfigMap values
+      if: inputs.configmap_values != ''
+      shell: bash
+      working-directory: ${{ inputs.overlay_dir }}
+      run: |
+        set -euo pipefail
+        echo "🔧 Injecting ConfigMap values..."
+        VALUES='${{ inputs.configmap_values }}'
+        
+        # Validate JSON
+        if ! echo "$VALUES" | jq empty 2>/dev/null; then
+          echo "::error::Invalid configmap_values JSON format"
+          exit 1
+        fi
+        
+        # Find ConfigMap name from kustomization.yaml
+        CONFIGMAP_NAME=""
+        if grep -q "^configMapGenerator:" kustomization.yaml; then
+          # Extract the first ConfigMap name from configMapGenerator
+          CONFIGMAP_NAME=$(sed -n '/^configMapGenerator:/,/^[^[:space:]]/p' kustomization.yaml | grep -m1 "^[ ]*- name:" | sed 's/.*name:[ ]*//')
+          if [ -n "$CONFIGMAP_NAME" ]; then
+            echo "  Found ConfigMap: $CONFIGMAP_NAME"
+          fi
+        fi
+        
+        if [ -z "$CONFIGMAP_NAME" ]; then
+          echo "::warning::No configMapGenerator found in kustomization.yaml. Skipping ConfigMap value injection."
+          exit 0
+        fi
+        
+        # Process each value to inject
+        echo "$VALUES" | jq -c '.[]' | while read -r value; do
+          KEY=$(echo "$value" | jq -r '.key // empty')
+          VAL=$(echo "$value" | jq -r '.value // empty')
+          
+          if [ -z "$KEY" ] || [ -z "$VAL" ]; then
+            echo "::error::configmap_values entries must have {\"key\",\"value\"}"
+            exit 1
+          fi
+          
+          echo "  - Setting $KEY=$VAL"
+          
+          # Create the patch using kustomize edit add patch
+          kustomize edit add patch \
+            --kind=ConfigMap \
+            --name="$CONFIGMAP_NAME" \
+            --patch="[{\"op\":\"add\",\"path\":\"/data/$KEY\",\"value\":\"$VAL\"}]"
         done
     
     - name: Validate kustomization

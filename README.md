@@ -9,6 +9,7 @@ Updates kustomize overlays with new image tags, labels, and annotations.
 - 🔖 **Annotations** - Set deployment metadata
 - 📅 **Automatic timestamps** - Track deployment times
 - 🎯 **Smart detection** - Handles various kustomize patterns
+- 🔧 **ConfigMap injection** - Inject runtime values into ConfigMaps
 
 ## Usage
 
@@ -26,13 +27,14 @@ Updates kustomize overlays with new image tags, labels, and annotations.
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
 | `overlay_dir` | Path to kustomize overlay | ✅ | - |
+| `debug` | Enable debug output | ❌ | `false` |
 | `image` | Image name (without tag) | ❌ | - |
 | `tag` | Image tag | ❌ | - |
 | `version_label` | Value for app.kubernetes.io/version label | ❌ | - |
-| `annotations` | Annotations to add (key=value format, one per line) | ❌ | - |
-| `labels` | Labels to add (key=value format, one per line) | ❌ | - |
+| `annotations` | Annotations to add (key:value or key=value format, one per line) | ❌ | - |
+| `labels` | Labels to add (key:value or key=value format, one per line) | ❌ | - |
 | `replicas` | Replicas count to set (JSON format) | ❌ | - |
-| `json_patches` | JSON6902 patches to apply (JSON array) | ❌ | - |
+| `configmap_values` | ConfigMap values to inject (JSON format) | ❌ | - |
 | `namespace` | Set namespace | ❌ | - |
 | `name_prefix` | Add name prefix | ❌ | - |
 | `name_suffix` | Add name suffix | ❌ | - |
@@ -65,13 +67,43 @@ Updates kustomize overlays with new image tags, labels, and annotations.
     image: backend
     tag: v2.0.0
     labels: |
-      version=v2.0.0
-      environment=production
-      team=platform
+      version:v2.0.0
+      environment:production
+      team:platform
     annotations: |
-      deployed-by=${{ github.actor }}
-      deployment-id=${{ github.run_id }}
+      deployed-by:${{ github.actor }}
+      deployment-id:${{ github.run_id }}
+    # Both key:value and key=value formats are supported
 ```
+
+### With debug output
+```yaml
+- name: Update with debugging
+  uses: KoalaOps/kustomize-edit@v1
+  with:
+    overlay_dir: deploy/overlays/staging
+    image: api
+    tag: latest
+    debug: 'true'  # Shows final kustomization.yaml
+```
+
+### Inject ConfigMap values
+```yaml
+- name: Deploy with runtime configuration
+  uses: KoalaOps/kustomize-edit@v1
+  with:
+    overlay_dir: deploy/overlays/production
+    image: backend
+    tag: ${{ github.sha }}
+    configmap_values: |
+      [
+        {"key": "SENTRY_RELEASE", "value": "${{ github.sha }}"},
+        {"key": "DEPLOYMENT_ID", "value": "${{ github.run_id }}"},
+        {"key": "ENVIRONMENT", "value": "production"}
+      ]
+```
+
+This automatically finds the ConfigMap defined in your `configMapGenerator` and patches these values into it at deployment time. Perfect for injecting runtime values like release versions, deployment IDs, or environment-specific configuration.
 
 ### Update multiple images
 ```yaml
@@ -129,16 +161,40 @@ commonAnnotations:
 
 ## Advanced Usage
 
+### Working with different container registries
 
-### Multi-registry support
+The action supports both simple image names and full registry paths. This is useful when:
+- Your images are stored in different registries (Docker Hub, GCR, ECR, etc.)
+- You need to specify exactly which registry to pull from
+- You're using private or corporate registries
+
 ```yaml
-- name: Update with full image path
+# Simple image name (uses default registry)
+- name: Update from Docker Hub
   uses: KoalaOps/kustomize-edit@v1
   with:
     overlay_dir: deploy/overlays/production
-    image: gcr.io/project/backend
+    image: nginx
+    tag: 1.21
+
+# Full registry path for Google Container Registry
+- name: Update from GCR
+  uses: KoalaOps/kustomize-edit@v1
+  with:
+    overlay_dir: deploy/overlays/production
+    image: gcr.io/my-project/backend
     tag: v1.2.3
+
+# Private registry example
+- name: Update from private registry
+  uses: KoalaOps/kustomize-edit@v1
+  with:
+    overlay_dir: deploy/overlays/production
+    image: registry.company.com/team/api-service
+    tag: ${{ github.sha }}
 ```
+
+When you provide the full registry path, kustomize knows exactly which image entry to update in your kustomization.yaml, even if you have multiple images with the same base name from different registries.
 
 ## Notes
 
