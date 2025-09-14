@@ -99,8 +99,10 @@ runs:
       run: |
         set -euo pipefail
         echo "🏷️ Setting image: ${{ inputs.image }}:${{ inputs.tag }}"
-        # Try to set image - kustomize will handle both new and existing images
-        kustomize edit set image "${{ inputs.image }}=${{ inputs.image }}:${{ inputs.tag }}"
+        # Set the image with its tag
+        # Format: [old-image-name=]new-image-name:new-tag
+        # kustomize will match any existing image that starts with the image name
+        kustomize edit set image "${{ inputs.image }}:${{ inputs.tag }}"
     
     - name: Set version label
       if: inputs.version_label != ''
