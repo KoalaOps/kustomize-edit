@@ -111,8 +111,7 @@ runs:
       run: |
         set -euo pipefail
         echo "🏷️ Setting version label: ${{ inputs.version_label }}"
-        # kustomize edit add label will update if exists or add if not
-        kustomize edit add label "app.kubernetes.io/version:${{ inputs.version_label }}"
+        kustomize edit set label "app.kubernetes.io/version:${{ inputs.version_label }}"
     
     - name: Add annotations
       if: inputs.annotations != ''
