@@ -130,7 +130,7 @@ runs:
           # Convert all = to : for kustomize format (support both formats)
           line="${line//=/:}"
           echo "  - $line"
-          kustomize edit add annotation "$line"
+          kustomize edit set annotation "$line" --force
         done
     
     - name: Add labels
