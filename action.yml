@@ -111,7 +111,41 @@ runs:
       run: |
         set -euo pipefail
         echo "🏷️ Setting version label: ${{ inputs.version_label }}"
-        kustomize edit set label "app.kubernetes.io/version:${{ inputs.version_label }}"
+
+        # Create a LabelTransformer to add version label only to pod templates
+        # This avoids the immutable selector field error in Kubernetes
+        cat > version-label-transformer.yaml <<EOF
+        apiVersion: kustomize.config.k8s.io/v1beta1
+        kind: LabelTransformer
+        metadata:
+          name: version-label
+        labels:
+          app.kubernetes.io/version: "${{ inputs.version_label }}"
+        fieldSpecs:
+          - kind: Deployment
+            path: spec/template/metadata/labels
+          - kind: StatefulSet
+            path: spec/template/metadata/labels
+          - kind: DaemonSet
+            path: spec/template/metadata/labels
+          - kind: Job
+            path: spec/template/metadata/labels
+          - kind: CronJob
+            path: spec/jobTemplate/spec/template/metadata/labels
+          - kind: Rollout
+            path: spec/template/metadata/labels
+            group: argoproj.io
+        EOF
+
+        # Add the transformer to kustomization.yaml
+        if grep -q "^transformers:" kustomization.yaml; then
+          echo "  - version-label-transformer.yaml" >> kustomization.yaml
+        else
+          cat >> kustomization.yaml <<EOF
+        transformers:
+          - version-label-transformer.yaml
+        EOF
+        fi
     
     - name: Add annotations
       if: inputs.annotations != ''
@@ -265,6 +299,18 @@ runs:
           kustomize build . 2>&1 | head -20
           exit 1
         fi
+
+        # Check that version label is not in selectors (would cause immutable field error)
+        if [ -n "${{ inputs.version_label }}" ]; then
+          echo "🔍 Checking selectors don't contain version label..."
+          MANIFESTS=$(kustomize build .)
+          if echo "$MANIFESTS" | grep -A10 "kind: Deployment\|kind: StatefulSet\|kind: DaemonSet" | grep -B5 "selector:" | grep -q "app.kubernetes.io/version"; then
+            echo "::error::Version label found in selector (immutable field). This would cause deployment to fail."
+            echo "::error::The version label should only be in pod templates, not selectors."
+            exit 1
+          fi
+        fi
+
         echo "✅ Kustomization is valid"
     
     - name: Show debug output
