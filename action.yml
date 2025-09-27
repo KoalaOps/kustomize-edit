@@ -61,19 +61,24 @@ runs:
       run: |
         set -euo pipefail
         echo "🔍 Checking required tools..."
-        
+
         # Check for kustomize
         if ! command -v kustomize >/dev/null 2>&1; then
           echo "::error::kustomize not found. Please install it first. See: https://kubectl.docs.kubernetes.io/installation/kustomize/"
           exit 1
         fi
-        
+
         # Check for jq (needed for replicas and configmap_values)
         if ([ -n "${{ inputs.replicas }}" ] || [ -n "${{ inputs.configmap_values }}" ]) && ! command -v jq >/dev/null 2>&1; then
           echo "::error::jq not found. Required for replicas or configmap_values input. Install with: apt-get install -y jq"
           exit 1
         fi
-        
+
+        # Check for yq (needed for version_label)
+        if [ -n "${{ inputs.version_label }}" ] && ! command -v yq >/dev/null 2>&1; then
+          echo "::warning::yq not found. Will be installed automatically if version_label is used."
+        fi
+
         echo "✅ Required tools available"
     
     - name: Validate overlay directory
@@ -112,40 +117,43 @@ runs:
         set -euo pipefail
         echo "🏷️ Setting version label: ${{ inputs.version_label }}"
 
-        # Create a LabelTransformer to add version label only to pod templates
-        # This avoids the immutable selector field error in Kubernetes
-        cat > version-label-transformer.yaml <<EOF
-        apiVersion: kustomize.config.k8s.io/v1beta1
-        kind: LabelTransformer
-        metadata:
-          name: version-label
-        labels:
-          app.kubernetes.io/version: "${{ inputs.version_label }}"
-        fieldSpecs:
-          - kind: Deployment
-            path: spec/template/metadata/labels
-          - kind: StatefulSet
-            path: spec/template/metadata/labels
-          - kind: DaemonSet
-            path: spec/template/metadata/labels
-          - kind: Job
-            path: spec/template/metadata/labels
-          - kind: CronJob
-            path: spec/jobTemplate/spec/template/metadata/labels
-          - kind: Rollout
-            path: spec/template/metadata/labels
-            group: argoproj.io
-        EOF
-
-        # Add the transformer to kustomization.yaml
-        if grep -q "^transformers:" kustomization.yaml; then
-          echo "  - version-label-transformer.yaml" >> kustomization.yaml
-        else
-          cat >> kustomization.yaml <<EOF
-        transformers:
-          - version-label-transformer.yaml
-        EOF
+        # Check if yq is available
+        if ! command -v yq >/dev/null 2>&1; then
+          echo "::error::yq not found. Installing yq..."
+          # Try to install yq based on the platform
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y yq
+          elif command -v brew >/dev/null 2>&1; then
+            brew install yq
+          else
+            # Fallback to downloading binary directly
+            echo "Installing yq binary..."
+            YQ_VERSION="v4.35.1"
+            ARCH=$(uname -m)
+            OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+            if [ "$ARCH" = "x86_64" ]; then ARCH="amd64"; fi
+            curl -sL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_${OS}_${ARCH}" -o /tmp/yq
+            chmod +x /tmp/yq
+            sudo mv /tmp/yq /usr/local/bin/yq
+          fi
         fi
+
+        VERSION_LABEL="${{ inputs.version_label }}"
+        export VERSION_LABEL
+
+        # 1) Remove any old commonLabels version to avoid selector contamination
+        yq -i 'del(.commonLabels."app.kubernetes.io/version")' kustomization.yaml 2>/dev/null || true
+
+        # 2) Merge into an existing templates-only labels entry, or create one
+        if yq -e '.labels[] | select(.includeTemplates == true and .includeSelectors == false)' kustomization.yaml >/dev/null 2>&1; then
+          # Update existing templates-only entry
+          yq -i '(.labels[] | select(.includeTemplates == true and .includeSelectors == false)).pairs."app.kubernetes.io/version" = env(VERSION_LABEL)' kustomization.yaml
+        else
+          # Add new templates-only entry
+          yq -i '.labels += [{"pairs": {"app.kubernetes.io/version": env(VERSION_LABEL)}, "includeSelectors": false, "includeTemplates": true}]' kustomization.yaml
+        fi
+
+        echo "✅ Version label set to: $VERSION_LABEL"
     
     - name: Add annotations
       if: inputs.annotations != ''
