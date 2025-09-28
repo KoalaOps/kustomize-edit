@@ -9,7 +9,7 @@ Updates kustomize overlays with new image tags, labels, and annotations.
 - 🔖 **Annotations** - Set deployment metadata
 - 📅 **Automatic timestamps** - Track deployment times
 - 🎯 **Smart detection** - Handles various kustomize patterns
-- 🔧 **ConfigMap injection** - Inject runtime values into ConfigMaps
+- 📄 **Environment file patching** - Update .env files for ConfigMap generation
 
 ## Usage
 
@@ -34,7 +34,7 @@ Updates kustomize overlays with new image tags, labels, and annotations.
 | `annotations` | Annotations to add (key:value or key=value format, one per line) | ❌ | - |
 | `labels` | Labels to add (key:value or key=value format, one per line) | ❌ | - |
 | `replicas` | Replicas count to set (JSON format) | ❌ | - |
-| `configmap_values` | ConfigMap values to inject (JSON format) | ❌ | - |
+| `env_patches` | Environment file patches (JSON format) | ❌ | - |
 | `namespace` | Set namespace | ❌ | - |
 | `name_prefix` | Add name prefix | ❌ | - |
 | `name_suffix` | Add name suffix | ❌ | - |
@@ -87,7 +87,7 @@ Updates kustomize overlays with new image tags, labels, and annotations.
     debug: 'true'  # Shows final kustomization.yaml
 ```
 
-### Inject ConfigMap values
+### Patch environment files (Recommended)
 ```yaml
 - name: Deploy with runtime configuration
   uses: KoalaOps/kustomize-edit@v1
@@ -95,15 +95,35 @@ Updates kustomize overlays with new image tags, labels, and annotations.
     overlay_dir: deploy/overlays/production
     image: backend
     tag: ${{ github.sha }}
-    configmap_values: |
-      [
-        {"key": "SENTRY_RELEASE", "value": "${{ github.sha }}"},
-        {"key": "DEPLOYMENT_ID", "value": "${{ github.run_id }}"},
-        {"key": "ENVIRONMENT", "value": "production"}
-      ]
+    env_patches: |
+      {
+        "container.env": {
+          "SENTRY_RELEASE": "${{ github.sha }}",
+          "DEPLOYMENT_ID": "${{ github.run_id }}",
+          "ENVIRONMENT": "production"
+        }
+      }
 ```
 
-This automatically finds the ConfigMap defined in your `configMapGenerator` and patches these values into it at deployment time. Perfect for injecting runtime values like release versions, deployment IDs, or environment-specific configuration.
+This patches environment files (like `container.env` or `.env`) that are used by Kustomize's `configMapGenerator`. This approach is cleaner for GitOps as changes are visible in the actual config files.
+
+### Multiple environment files
+```yaml
+- name: Patch multiple env files
+  uses: KoalaOps/kustomize-edit@v1
+  with:
+    overlay_dir: deploy/overlays/production
+    env_patches: |
+      {
+        "container.env": {
+          "API_URL": "https://api.production.example.com",
+          "ENVIRONMENT": "production"
+        },
+        "secrets.env": {
+          "SENTRY_DSN": "${{ secrets.SENTRY_DSN }}"
+        }
+      }
+```
 
 ### Update multiple images
 ```yaml
@@ -158,6 +178,41 @@ commonLabels:
 commonAnnotations:
   last-deployed: "2024-01-15T10:30:00Z"
 ```
+
+## Environment File Patching
+
+The `env_patches` input integrates with [KoalaOps/patch-env-files](https://github.com/KoalaOps/patch-env-files) to update environment files used by Kustomize's `configMapGenerator`.
+
+### How it works
+
+If your kustomization.yaml includes:
+```yaml
+configMapGenerator:
+  - name: app-config
+    envs:
+      - container.env
+```
+
+You can patch `container.env` with runtime values:
+```yaml
+- uses: KoalaOps/kustomize-edit@v1
+  with:
+    overlay_dir: deploy/overlays/production
+    env_patches: |
+      {
+        "container.env": {
+          "VERSION": "${{ github.sha }}",
+          "BUILD_NUMBER": "${{ github.run_number }}"
+        }
+      }
+```
+
+### Benefits
+
+1. **GitOps friendly** - Changes are visible in actual files
+2. **Simpler** - Direct file updates instead of JSON patch operations
+3. **More flexible** - Can update multiple env files independently
+4. **Better diffs** - Git shows actual configuration changes
 
 ## Advanced Usage
 
