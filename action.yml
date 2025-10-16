@@ -15,10 +15,13 @@ inputs:
     required: false
     default: 'false'
   image:
-    description: 'Image name (without tag)'
+    description: 'Container image (e.g., registry.io/app or registry.io/app:v1.2.3)'
     required: false
   tag:
-    description: 'Image tag'
+    description: 'Image tag (e.g., v1.2.3, latest, sha-abc123)'
+    required: false
+  images_json:
+    description: 'Multiple images as JSON array: [{"name":"registry.io/app","newTag":"v1.2.3"}]'
     required: false
   version_label:
     description: 'Value for app.kubernetes.io/version label'
@@ -96,18 +99,111 @@ runs:
         fi
         
         echo "✅ Found kustomization.yaml in: ${{ inputs.overlay_dir }}"
-    
-    - name: Set image and tag
-      if: inputs.image != '' && inputs.tag != ''
+
+    - name: Patch environment files
+      if: inputs.env_patches != ''
+      uses: KoalaOps/patch-env-files@v1
+      with:
+        path: ${{ inputs.overlay_dir }}
+        patches: ${{ inputs.env_patches }}
+
+    - name: Normalize image inputs
+      id: normalize
+      if: inputs.image != '' || inputs.images_json != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ -n "${{ inputs.images_json }}" ]; then
+          # Using images_json - ensure image/tag are not provided
+          if [ -n "${{ inputs.image }}" ] || [ -n "${{ inputs.tag }}" ]; then
+            echo "::error::When using images_json, do not provide image or tag parameters"
+            exit 1
+          fi
+          echo "using_images_json=true" >> $GITHUB_OUTPUT
+          echo "normalized_image=" >> $GITHUB_OUTPUT
+          echo "normalized_tag=" >> $GITHUB_OUTPUT
+        else
+          # Not using images_json - require image parameter
+          if [ -z "${{ inputs.image }}" ]; then
+            echo "::error::Must provide either images_json OR image parameter"
+            exit 1
+          fi
+
+          # Check if image contains embedded tag (backwards compatibility: image:tag format)
+          IMAGE="${{ inputs.image }}"
+          if [[ "$IMAGE" =~ ^(.+):([^/]+)$ ]]; then
+            # Split image:tag format (backwards compatibility)
+            NORMALIZED_IMAGE="${BASH_REMATCH[1]}"
+            NORMALIZED_TAG="${BASH_REMATCH[2]}"
+            echo "normalized_image=$NORMALIZED_IMAGE" >> $GITHUB_OUTPUT
+            echo "normalized_tag=$NORMALIZED_TAG" >> $GITHUB_OUTPUT
+            echo "✓ Detected embedded tag in image parameter - image: $NORMALIZED_IMAGE, tag: $NORMALIZED_TAG"
+            # Warn if both formats provided
+            if [ -n "${{ inputs.tag }}" ]; then
+              echo "::warning::Both image:tag format and separate tag parameter provided. Using embedded tag from image."
+            fi
+          else
+            # Image doesn't contain tag, require explicit tag parameter
+            if [ -z "${{ inputs.tag }}" ]; then
+              echo "::error::Image parameter does not contain a tag. Please provide the tag parameter or use image:tag format."
+              exit 1
+            fi
+            echo "normalized_image=$IMAGE" >> $GITHUB_OUTPUT
+            echo "normalized_tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+            echo "✓ Using separate image and tag parameters"
+          fi
+          echo "using_images_json=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Set images (single or multiple)
+      if: inputs.image != '' || inputs.images_json != ''
       shell: bash
       working-directory: ${{ inputs.overlay_dir }}
       run: |
         set -euo pipefail
-        echo "🏷️ Setting image: ${{ inputs.image }}:${{ inputs.tag }}"
-        # Set the image with its tag
-        # Format: [old-image-name=]new-image-name:new-tag
-        # kustomize will match any existing image that starts with the image name
-        kustomize edit set image "${{ inputs.image }}:${{ inputs.tag }}"
+
+        # Process images_json
+        if [ -n "${{ inputs.images_json }}" ]; then
+          # Validate JSON format
+          if ! echo '${{ inputs.images_json }}' | jq empty 2>/dev/null; then
+            echo "::error::Invalid images_json format. Expected JSON array like: [{\"name\":\"registry.io/app\",\"newTag\":\"v1.2.3\"}]"
+            exit 1
+          fi
+
+          # Count images
+          IMAGE_COUNT=$(echo '${{ inputs.images_json }}' | jq 'length')
+
+          # Collect image summary for logging
+          IMAGE_SUMMARY=$(echo '${{ inputs.images_json }}' | jq -r '.[] | "\(.name):\(.newTag)"' | paste -sd ', ' -)
+
+          # Iterate through images and set each one
+          echo '${{ inputs.images_json }}' | jq -c '.[]' | while read -r img; do
+            NAME=$(echo "$img" | jq -r '.name // empty')
+            NEW_TAG=$(echo "$img" | jq -r '.newTag // empty')
+
+            if [ -z "$NAME" ]; then
+              echo "::error::Image entry missing 'name' field: $img"
+              exit 1
+            fi
+
+            if [ -z "$NEW_TAG" ]; then
+              echo "::error::Image entry missing 'newTag' field: $img"
+              exit 1
+            fi
+
+            kustomize edit set image "$NAME:$NEW_TAG"
+          done
+
+          echo "✅ Set $IMAGE_COUNT image(s): $IMAGE_SUMMARY"
+
+        # Process single image (using normalized values)
+        else
+          NORM_IMAGE="${{ steps.normalize.outputs.normalized_image }}"
+          NORM_TAG="${{ steps.normalize.outputs.normalized_tag }}"
+          kustomize edit set image "$NORM_IMAGE:$NORM_TAG"
+          echo "✅ Set image: $NORM_IMAGE:$NORM_TAG"
+        fi
     
     - name: Set version label
       if: inputs.version_label != ''
@@ -246,14 +342,7 @@ runs:
           echo "  - $NAME: $COUNT replicas"
           kustomize edit set replicas "${NAME}=${COUNT}"
         done
-    
-    - name: Patch environment files
-      if: inputs.env_patches != ''
-      uses: KoalaOps/patch-env-files@v1
-      with:
-        path: ${{ inputs.overlay_dir }}
-        patches: ${{ inputs.env_patches }}
-    
+
     - name: Validate kustomization
       shell: bash
       working-directory: ${{ inputs.overlay_dir }}
