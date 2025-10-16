@@ -13,6 +13,7 @@ Updates kustomize overlays with new image tags, labels, and annotations.
 
 ## Usage
 
+### Single image (recommended - separate image and tag)
 ```yaml
 - name: Update kustomize overlay
   uses: KoalaOps/kustomize-edit@v1
@@ -22,14 +23,37 @@ Updates kustomize overlays with new image tags, labels, and annotations.
     tag: v1.2.3
 ```
 
+### Single image (backwards compatible - image:tag format)
+```yaml
+- name: Update kustomize overlay
+  uses: KoalaOps/kustomize-edit@v1
+  with:
+    overlay_dir: deploy/overlays/production
+    image: backend:v1.2.3
+```
+
+### Multiple images
+```yaml
+- name: Update multiple images
+  uses: KoalaOps/kustomize-edit@v1
+  with:
+    overlay_dir: deploy/overlays/production
+    images_json: |
+      [
+        {"name": "backend", "newTag": "v1.2.3"},
+        {"name": "backend-migrator", "newTag": "v1.2.3"}
+      ]
+```
+
 ## Inputs
 
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
 | `overlay_dir` | Path to kustomize overlay | ✅ | - |
 | `debug` | Enable debug output | ❌ | `false` |
-| `image` | Image name (without tag) | ❌ | - |
-| `tag` | Image tag | ❌ | - |
+| `image` | Container image name | ❌* | - |
+| `tag` | Image tag | ❌* | - |
+| `images_json` | Multiple images as JSON array | ❌* | - |
 | `version_label` | Value for app.kubernetes.io/version label | ❌ | - |
 | `annotations` | Annotations to add (key:value or key=value format, one per line) | ❌ | - |
 | `labels` | Labels to add (key:value or key=value format, one per line) | ❌ | - |
@@ -38,6 +62,11 @@ Updates kustomize overlays with new image tags, labels, and annotations.
 | `namespace` | Set namespace | ❌ | - |
 | `name_prefix` | Add name prefix | ❌ | - |
 | `name_suffix` | Add name suffix | ❌ | - |
+
+\* **Image input options** (choose one):
+  - Option 1: `image` (with embedded tag, e.g., `registry.io/app:v1.2.3`)
+  - Option 2: `image` + `tag` (separate, e.g., `image: registry.io/app`, `tag: v1.2.3`)
+  - Option 3: `images_json` (for multiple images)
 
 ## Outputs
 
@@ -153,7 +182,88 @@ This patches environment files (like `container.env` or `.env`) that are used by
     namespace: pr-${{ github.event.number }}
 ```
 
+## Image Input Formats
+
+This action supports three formats for specifying images:
+
+### 1. Separate image and tag (recommended)
+```yaml
+image: registry.io/app
+tag: v1.2.3
+```
+
+### 2. Embedded tag (backwards compatible)
+```yaml
+image: registry.io/app:v1.2.3
+```
+
+### 3. Multiple images (via JSON)
+```yaml
+images_json: |
+  [
+    {"name": "registry.io/app", "newTag": "v1.2.3"},
+    {"name": "registry.io/app-migrator", "newTag": "v1.2.3"}
+  ]
+```
+
+## Multiple Images Support
+
+The `images_json` input allows you to update multiple container images in a single action call. This is particularly useful for:
+
+- **Main + auxiliary images** (e.g., app + migrator, app + sidecar)
+- **Microservices with multiple containers** in the same deployment
+- **Services with init containers** that need version pinning
+
+### Format
+
+The `images_json` input expects a JSON array matching [Kustomize's native image format](https://kubectl.docs.kubernetes.io/references/kustomize/kustomization/images/):
+
+```json
+[
+  {
+    "name": "registry.io/app",
+    "newTag": "v1.2.3"
+  },
+  {
+    "name": "registry.io/app-migrator",
+    "newTag": "v1.2.3"
+  }
+]
+```
+
+**Required fields:**
+- `name` - Full image name/repository (e.g., `gcr.io/project/image` or `myapp`)
+- `newTag` - New tag to set (e.g., `v1.2.3`, `latest`, `main-abc123`)
+
+**Mutual Exclusivity:**
+Provide either `images_json` OR `image` (with or without tag), not both. The action will error if both are provided.
+
+### Example: Service with database migrator
+
+```yaml
+- name: Update app and migrator images
+  uses: KoalaOps/kustomize-edit@v1
+  with:
+    overlay_dir: deploy/overlays/production
+    images_json: |
+      [
+        {"name": "europe-docker.pkg.dev/myproject/myapp", "newTag": "${{ github.sha }}"},
+        {"name": "europe-docker.pkg.dev/myproject/myapp-migrator", "newTag": "${{ github.sha }}"}
+      ]
+```
+
 ## How It Works
+
+This action is the **single source of truth** for image input handling in the KoalaOps action ecosystem. It:
+
+1. **Validates and normalizes** all image input formats (embedded tag, separate params, or multi-image JSON)
+2. **Modifies** `kustomization.yaml` using kustomize CLI commands
+3. **Updates** labels, annotations, and other kustomize fields
+4. **Validates** that the final kustomization builds successfully
+
+Higher-level orchestrator actions like `kustomize-deploy` delegate all image handling to this action, ensuring consistent behavior across the ecosystem.
+
+### Example Transformation
 
 The action modifies `kustomization.yaml`:
 
@@ -253,6 +363,9 @@ When you provide the full registry path, kustomize knows exactly which image ent
 
 ## Notes
 
+- **Backwards compatible**: Supports legacy `image:tag` format automatically
+- **Three input formats**: Embedded tag, separate params, or multi-image JSON
+- **Used by orchestrators**: `kustomize-deploy` and other actions delegate to this for image handling
 - Preserves existing kustomization.yaml structure
 - Creates kustomization.yaml if it doesn't exist
 - Supports both `newTag` and `newName` patterns
